@@ -1,0 +1,13 @@
+# AgentFlow 复用 SmartKB 的主要依赖
+streamlit>=1.28.0
+langchain>=0.3.0
+langchain-openai>=0.2.0
+langchain-community>=0.3.0
+langgraph>=0.2.0
+python-dotenv>=1.0.0
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0
+pymilvus>=2.4.0
+rank-bm25>=0.2.0
+jieba>=0.42.0
+dashscope>=1.20.0
