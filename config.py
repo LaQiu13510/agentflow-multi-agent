@@ -27,7 +27,7 @@ load_dotenv(ROOT_DIR / ".env", override=True)
 # LLM
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
 
 # Embedding
 ZHIPUAI_API_KEY = os.getenv("ZHIPUAI_API_KEY", "")
@@ -47,5 +47,13 @@ AGENTFLOW_MEMORY_TABLE = os.getenv(
 )
 DEFAULT_SESSION_ID = "agentflow-demo"
 TOP_K_KNOWLEDGE = int(os.getenv("AGENTFLOW_TOP_K", "4"))
+
+# Image generation
+IMAGE_API_KEY = os.getenv("IMAGE_API_KEY", "")
+IMAGE_API_BASE = os.getenv("IMAGE_API_BASE", "https://www.right.codes/draw/v1")
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-2")
+IMAGE_TIMEOUT_SECONDS = float(os.getenv("IMAGE_TIMEOUT_SECONDS", "120"))
+IMAGE_OUTPUT_DIR = DATA_DIR / "generated_images"
+IMAGE_OUTPUT_DIR.mkdir(exist_ok=True)
 
 

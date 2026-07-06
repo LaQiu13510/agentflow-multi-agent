@@ -9,6 +9,7 @@ AgentFlow is a local multi-agent coordination platform for LLM applications. It 
 - MCP-style local tool protocol with `list_tools` and `call_tool` interfaces.
 - PostgreSQL-backed short-term memory with in-memory fallback for demos and tests.
 - Milvus retrieval over the SmartKB collection from `smartkb-rag`.
+- Image generation through an OpenAI-compatible image API (`gpt-image-2` by default).
 - Streamlit UI showing route decisions, tool calls, observations, latency, and memory status.
 - Offline deterministic tests plus live health checks for external services.
 
@@ -23,6 +24,7 @@ User task
        -> PostgreSQL metadata and memory
        -> Milvus SmartKB retrieval
        -> Project engineering helper tools
+       -> Image generation tools
   -> finalize answer and trace
   -> save_memory
 ```
@@ -56,6 +58,18 @@ streamlit run app.py --server.port 8502
 ```
 
 Open http://localhost:8502.
+
+## Image Generation
+
+Set these values in `.env` to enable image generation:
+
+```powershell
+IMAGE_API_KEY=your_image_api_key
+IMAGE_API_BASE=https://www.right.codes/draw/v1
+IMAGE_MODEL=gpt-image-2
+```
+
+Then ask AgentFlow to generate an image, for example: `生成一张 RAG 系统架构图风格的图片`.
 
 ## Live Checks
 

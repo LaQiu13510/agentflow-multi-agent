@@ -243,6 +243,13 @@ def render_trace(state: dict[str, Any] | None) -> None:
     for item in state.get("observations", []):
         with st.expander(item.get("tool", "tool observation")):
             st.write(item.get("content", ""))
+            metadata = item.get("metadata") or {}
+            image_path = metadata.get("image_path")
+            image_url = metadata.get("image_url")
+            if image_path:
+                st.image(image_path)
+            elif image_url:
+                st.markdown(f"[打开生成图片]({image_url})")
 
 
 def render_chat() -> None:

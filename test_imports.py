@@ -58,6 +58,7 @@ def check_registry():
         "postgres.list_smartkb_documents",
         "milvus.search_smartkb",
         "project.project_summary",
+        "image.generate_image",
     }
     assert required.issubset(names)
     return f"tools={len(tools)}"
@@ -70,6 +71,7 @@ def check_keyword_router():
     assert router(None, "帮我写一段项目技术报告") == "writer"
     assert router(None, "设计 MCP server 的代码结构") == "engineer"
     assert router(None, "检索知识库里的 RAG 文档") == "researcher"
+    assert router(None, "生成一张 AgentFlow 架构图片") == "general"
     return "keyword routes ok"
 
 

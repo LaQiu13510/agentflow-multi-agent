@@ -80,6 +80,8 @@ class SupervisorAgent:
 
     def _keyword_route(self, task: str) -> str | None:
         text = task.lower()
+        if any(word in text for word in ["生图", "图片", "图像", "image", "generate image", "gpt-image"]):
+            return "general"
         if any(word in text for word in ["检索", "知识库", "资料", "rag", "milvus", "postgresql"]):
             return "researcher"
         if any(word in text for word in ["架构", "实现", "代码", "接口", "测试", "bug", "部署", "mcp server"]):

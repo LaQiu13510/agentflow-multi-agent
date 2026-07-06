@@ -84,12 +84,31 @@ class FakeProjectServer(LocalMCPServer):
         return ToolResult(True, "Checklist: MCP boundaries, agent evaluation, and deployment readiness.")
 
 
+class FakeImageServer(LocalMCPServer):
+    server_name = "image"
+
+    def register_tools(self):
+        self.add_tool(ToolSpec("health", "fake image health"), self.health)
+        self.add_tool(ToolSpec("generate_image", "fake image generation"), self.generate_image)
+
+    def health(self):
+        return ToolResult(True, "Fake image API 正常")
+
+    def generate_image(self, prompt: str, size: str = "1024x1024"):
+        return ToolResult(
+            True,
+            "图片已生成: data/generated_images/fake.png",
+            {"image_path": "data/generated_images/fake.png", "size": size},
+        )
+
+
 def build_fake_registry() -> ToolRegistry:
     return ToolRegistry(
         [
             FakePostgresServer(),
             FakeMilvusServer(),
             FakeProjectServer(),
+            FakeImageServer(),
         ]
     )
 
@@ -133,6 +152,7 @@ def run_offline_e2e():
         ("请检索知识库中关于混合检索和 RRF 的资料", "researcher"),
         ("帮我设计一个 MCP server 的代码结构和测试方案", "engineer"),
         ("写一段 AgentFlow README 摘要", "writer"),
+        ("生成一张 AgentFlow 架构图片", "general"),
     ]
     last_state = None
     for task, expected_route in cases:

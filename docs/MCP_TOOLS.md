@@ -40,6 +40,15 @@ Server name: `project`
 | `project_summary` | Generate a compact project summary |
 | `quality_checklist` | Produce quality checks for the supplied stack |
 
+## Image Server
+
+Server name: `image`
+
+| Tool | Purpose |
+| --- | --- |
+| `health` | Check image API configuration |
+| `generate_image` | Generate an image from a text prompt with Right Code's `gpt-image-2` by default |
+
 ## Why This Shape
 
 The local implementation avoids the operational cost of multiple background processes while preserving the key design idea: workers depend on tool contracts, not direct database or vector-store code.
