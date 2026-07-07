@@ -1,12 +1,14 @@
-﻿"""AgentFlow Streamlit 应用入口。"""
+"""AgentFlow FastAPI application."""
 
 from __future__ import annotations
 
-import time
+from functools import lru_cache
 from typing import Any
 
-import streamlit as st
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 from langchain_core.messages import HumanMessage
+from pydantic import BaseModel, Field
 
 from agent_team.memory import get_memory
 from agent_team.skills import get_skill_registry
@@ -18,303 +20,673 @@ from models.llm import get_llm
 from tools.registry import build_tool_registry
 
 
-st.set_page_config(
-    page_title="AgentFlow",
-    page_icon="AF",
-    layout="wide",
-    initial_sidebar_state="expanded",
+app = FastAPI(
+    title="AgentFlow",
+    description="Supervisor + Worker Agents + MCP-style tools",
+    version="1.0.0",
 )
-
-
-CUSTOM_CSS = """
-<style>
-.block-container {
-    padding-top: 1.4rem;
-    padding-bottom: 2rem;
-    max-width: 1280px;
-}
-.main-title {
-    font-size: 2rem;
-    font-weight: 720;
-    margin: 0;
-}
-.subtle {
-    color: #667085;
-    font-size: 0.92rem;
-}
-.metric-row {
-    display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 0.75rem;
-}
-.metric-box {
-    border: 1px solid #e4e7ec;
-    border-radius: 8px;
-    padding: 0.8rem 0.9rem;
-    background: #ffffff;
-}
-.metric-label {
-    color: #667085;
-    font-size: 0.76rem;
-}
-.metric-value {
-    color: #101828;
-    font-size: 1.05rem;
-    font-weight: 650;
-    margin-top: 0.15rem;
-    overflow-wrap: anywhere;
-}
-.tool-chip {
-    display: inline-block;
-    border: 1px solid #d0d5dd;
-    border-radius: 999px;
-    padding: 0.18rem 0.55rem;
-    margin: 0.12rem 0.15rem 0.12rem 0;
-    font-size: 0.78rem;
-    color: #344054;
-    background: #f9fafb;
-}
-</style>
-"""
 
 
 EXAMPLES = [
     "检索 SmartKB 中关于混合检索和 RRF 的内容，并输出技术摘要。",
-    "设计一个 MCP Server，用来给 AgentFlow 查询 PostgreSQL 里的对话记忆。",
-    "把 AgentFlow 的架构整理成一段项目 README 摘要。",
-    "比较 SmartKB 和 AgentFlow 的架构边界，并说明如何组合使用。",
+    "设计一个 MCP Server，用来查询 PostgreSQL 里的对话记忆。",
+    "写一段 AgentFlow README 摘要。",
+    "生成一个多 Agent 协作架构图。",
 ]
 
 
-def _init_state() -> None:
-    if "session_id" not in st.session_state:
-        st.session_state.session_id = DEFAULT_SESSION_ID
-    if "history" not in st.session_state:
-        st.session_state.history = []
-    if "last_state" not in st.session_state:
-        st.session_state.last_state = None
+class RunRequest(BaseModel):
+    task: str = Field(..., min_length=1, max_length=4000)
+    session_id: str = DEFAULT_SESSION_ID
 
 
-@st.cache_resource(show_spinner=False)
-def get_registry():
+@lru_cache(maxsize=1)
+def get_registry_cached():
     return build_tool_registry()
 
 
-@st.cache_resource(show_spinner=False)
-def get_graph():
-    return build_agent_team(get_registry())
+@lru_cache(maxsize=1)
+def get_graph_cached():
+    return build_agent_team(get_registry_cached())
 
 
-def safe_check(label: str, fn) -> tuple[str, bool, str]:
+def memory_stats() -> dict[str, Any]:
     try:
-        ok, detail = fn()
-        return label, bool(ok), str(detail)
+        return get_memory().stats()
     except Exception as exc:
-        return label, False, str(exc)[:180]
+        return {"backend": "unavailable", "total_messages": 0, "error": str(exc)[:180]}
 
 
-def run_health_checks() -> list[tuple[str, bool, str]]:
-    registry = get_registry()
-    checks = [
-        safe_check("DeepSeek", lambda: get_llm().test_connection()),
-        safe_check("Embedding", lambda: get_embedding_model().test_connection()),
-        safe_check(
-            "PostgreSQL",
-            lambda: _tool_check(registry, "postgres", "health"),
-        ),
-        safe_check(
-            "Milvus",
-            lambda: _tool_check(registry, "milvus", "health"),
-        ),
-    ]
+def service_checks() -> list[dict[str, Any]]:
+    checks = []
+    checks.append(_safe_check("DeepSeek", lambda: get_llm(max_tokens=64).test_connection()))
+    checks.append(_safe_check("Embedding", lambda: get_embedding_model().test_connection()))
+    checks.append(_safe_tool_check("PostgreSQL", "postgres", "health"))
+    checks.append(_safe_tool_check("Milvus", "milvus", "health"))
+    checks.append(_safe_tool_check("Image", "image", "health"))
     return checks
 
 
-def _tool_check(registry, server: str, tool: str) -> tuple[bool, str]:
-    result = registry.call(server, tool)
-    return result.success, result.content
-
-
-def render_sidebar() -> None:
-    with st.sidebar:
-        st.header("AgentFlow")
-        st.caption("Supervisor + Worker Agents + MCP Tools")
-
-        st.session_state.session_id = st.text_input(
-            "Session ID",
-            value=st.session_state.session_id,
-            help="同一个 Session 会复用 PostgreSQL 短期记忆。",
-        )
-
-        if st.button("连接检查", use_container_width=True):
-            st.session_state.health_checks = run_health_checks()
-
-        checks = st.session_state.get("health_checks", [])
-        for label, ok, detail in checks:
-            with st.status(
-                f"{label}: {'正常' if ok else '异常'}",
-                state="complete" if ok else "error",
-            ):
-                st.write(detail)
-
-        st.divider()
-        st.subheader("MCP 工具")
-        for item in get_registry().list_tools():
-            st.caption(f"{item['server']}.{item['name']} - {item['description']}")
-
-        st.divider()
-        st.subheader("Skills")
-        for item in get_skill_registry().list_skills():
-            tools = ", ".join(item["suggested_tools"]) or "none"
-            st.caption(f"{item['name']} -> {item['route']} · tools: {tools}")
-            st.caption(item["worker_detail"])
-
-        st.divider()
-        if st.button("清空本页对话", use_container_width=True):
-            st.session_state.history = []
-            st.session_state.last_state = None
-            st.rerun()
-
-
-def render_header() -> None:
-    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
-    st.markdown('<p class="main-title">AgentFlow Multi-Agent 协作平台</p>', unsafe_allow_html=True)
-    st.markdown(
-        '<p class="subtle">用 LangGraph 编排 Supervisor，由 researcher、engineer、writer、general 四类 Worker 调用 MCP 风格工具完成任务。</p>',
-        unsafe_allow_html=True,
-    )
-
-
-def render_metrics(last_state: dict[str, Any] | None) -> None:
-    memory_stats = {"total_messages": 0, "sessions": 0}
+def _safe_check(label: str, fn) -> dict[str, Any]:
     try:
-        memory_stats = get_memory().stats()
-    except Exception:
-        pass
-
-    route = (last_state or {}).get("route", "-")
-    latency = (last_state or {}).get("latency_ms", "-")
-    tools = (last_state or {}).get("used_tools", [])
-    backend = memory_stats.get("backend", "-")
-
-    st.markdown(
-        f"""
-<div class="metric-row">
-  <div class="metric-box"><div class="metric-label">最近路由</div><div class="metric-value">{route}</div></div>
-  <div class="metric-box"><div class="metric-label">延迟</div><div class="metric-value">{latency} ms</div></div>
-  <div class="metric-box"><div class="metric-label">工具调用</div><div class="metric-value">{len(tools)}</div></div>
-  <div class="metric-box"><div class="metric-label">记忆</div><div class="metric-value">{memory_stats['total_messages']} / {backend}</div></div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
+        ok, detail = fn()
+        return {"label": label, "ok": bool(ok), "detail": str(detail)}
+    except Exception as exc:
+        return {"label": label, "ok": False, "detail": str(exc)[:180]}
 
 
-def render_examples() -> None:
-    cols = st.columns(2)
-    for idx, example in enumerate(EXAMPLES):
-        with cols[idx % 2]:
-            if st.button(example, key=f"example-{idx}", use_container_width=True):
-                st.session_state.pending_prompt = example
+def _safe_tool_check(label: str, server: str, tool: str) -> dict[str, Any]:
+    result = get_registry_cached().call(server, tool)
+    return {"label": label, "ok": result.success, "detail": result.content}
 
 
-def run_agent(task: str) -> dict[str, Any]:
-    graph = get_graph()
-    start = time.time()
+@app.get("/", response_class=HTMLResponse)
+def index() -> HTMLResponse:
+    return HTMLResponse(INDEX_HTML)
+
+
+@app.get("/api/meta")
+def meta() -> dict[str, Any]:
+    return {
+        "examples": EXAMPLES,
+        "tools": get_registry_cached().list_tools(),
+        "skills": get_skill_registry().list_skills(),
+        "memory": memory_stats(),
+        "traces": get_trace_store().recent(limit=8),
+    }
+
+
+@app.get("/api/health")
+def health() -> dict[str, Any]:
+    return {"checks": service_checks(), "memory": memory_stats()}
+
+
+@app.get("/api/traces")
+def traces(limit: int = 8) -> dict[str, Any]:
+    return {"traces": get_trace_store().recent(limit=limit)}
+
+
+@app.post("/api/run")
+def run_agent(request: RunRequest) -> dict[str, Any]:
+    graph = get_graph_cached()
     state = graph.invoke(
         {
-            "messages": [HumanMessage(content=task)],
-            "session_id": st.session_state.session_id,
+            "messages": [HumanMessage(content=request.task)],
+            "session_id": request.session_id or DEFAULT_SESSION_ID,
         }
     )
-    state.setdefault("latency_ms", round((time.time() - start) * 1000, 1))
-    return state
+    return {
+        "session_id": state.get("session_id", request.session_id),
+        "task": state.get("task", request.task),
+        "route": state.get("route", "-"),
+        "route_reason": state.get("route_reason", "-"),
+        "skill_name": state.get("skill_name", ""),
+        "used_tools": state.get("used_tools", []),
+        "observations": state.get("observations", []),
+        "final_answer": state.get("final_answer") or state.get("worker_output", ""),
+        "latency_ms": state.get("latency_ms", 0),
+        "memory": memory_stats(),
+        "trace": state.get("trace_record", {}),
+    }
 
 
-def render_trace(state: dict[str, Any] | None) -> None:
-    if not state:
-        st.info("运行一次任务后，这里会展示 Supervisor 路由、工具调用和观察结果。")
-        return
+INDEX_HTML = r"""
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AgentFlow</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --line: #d9dee7;
+      --muted: #667085;
+      --text: #101828;
+      --accent: #2563eb;
+      --ok: #087443;
+      --warn: #b54708;
+      --bad: #b42318;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    button, textarea, input { font: inherit; }
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      background: rgba(246, 247, 249, 0.96);
+      border-bottom: 1px solid var(--line);
+      backdrop-filter: blur(10px);
+      box-shadow: 0 8px 24px rgba(16, 24, 40, 0.04);
+    }
+    .top-inner {
+      max-width: 1440px;
+      margin: 0 auto;
+      padding: 14px 20px;
+      display: grid;
+      grid-template-columns: minmax(220px, 1fr) 3fr;
+      gap: 16px;
+      align-items: center;
+    }
+    h1 {
+      margin: 0;
+      font-size: 22px;
+      line-height: 1.2;
+      letter-spacing: 0;
+    }
+    .subtitle {
+      color: var(--muted);
+      font-size: 13px;
+      margin-top: 3px;
+    }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .metric {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 9px 10px;
+      min-width: 0;
+    }
+    .metric-label {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .metric-value {
+      font-weight: 650;
+      margin-top: 2px;
+      overflow-wrap: anywhere;
+    }
+    .shell {
+      max-width: 1440px;
+      margin: 0 auto;
+      padding: 18px 20px 32px;
+      display: grid;
+      grid-template-columns: minmax(0, 1.45fr) minmax(360px, 0.9fr);
+      gap: 18px;
+      align-items: start;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
+    }
+    .main-panel { padding: 16px; }
+    .workspace-title {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 14px;
+      margin-bottom: 14px;
+    }
+    .workspace-title h2 {
+      font-size: 18px;
+      margin: 0;
+      letter-spacing: 0;
+    }
+    .workspace-title p {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .kbd {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 4px 7px;
+      color: var(--muted);
+      background: #f9fafb;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .run-state {
+      border: 1px solid #bfdbfe;
+      background: #eff6ff;
+      color: #1d4ed8;
+      border-radius: 8px;
+      padding: 9px 11px;
+      margin-bottom: 12px;
+      font-size: 13px;
+    }
+    .run-state.busy {
+      border-color: #fed7aa;
+      background: #fff7ed;
+      color: #c2410c;
+    }
+    .run-state.done {
+      border-color: #bbf7d0;
+      background: #f0fdf4;
+      color: #047857;
+    }
+    .inspector {
+      position: sticky;
+      top: 96px;
+      max-height: calc(100vh - 116px);
+      overflow: auto;
+      padding: 16px;
+    }
+    .section-title {
+      font-weight: 700;
+      margin: 0 0 10px;
+    }
+    .session-row {
+      display: grid;
+      grid-template-columns: 120px minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+    .session-row label {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    input, textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 11px;
+      background: #fff;
+      color: var(--text);
+      outline: none;
+    }
+    input:focus, textarea:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+    }
+    textarea {
+      min-height: 120px;
+      resize: vertical;
+    }
+    .examples {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin: 12px 0;
+    }
+    .btn {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 9px 11px;
+      cursor: pointer;
+      text-align: left;
+    }
+    .btn:hover { border-color: var(--accent); }
+    .primary {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+      text-align: center;
+      font-weight: 650;
+    }
+    .ghost { color: var(--muted); }
+    .chat {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-top: 14px;
+    }
+    .msg {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .msg.user {
+      background: #f8fbff;
+      border-color: #c7d7fe;
+    }
+    .msg.assistant {
+      background: #fff;
+    }
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin: 8px 0 12px;
+    }
+    .chip {
+      display: inline-flex;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 3px 8px;
+      font-size: 12px;
+      color: #344054;
+      background: #f9fafb;
+      max-width: 100%;
+      overflow-wrap: anywhere;
+    }
+    .trace-block {
+      border-top: 1px solid var(--line);
+      padding-top: 12px;
+      margin-top: 12px;
+    }
+    .stage-list {
+      display: grid;
+      gap: 6px;
+      margin: 8px 0 12px;
+    }
+    .stage {
+      display: grid;
+      grid-template-columns: 18px minmax(0, 1fr);
+      gap: 8px;
+      align-items: center;
+      color: #344054;
+      font-size: 13px;
+    }
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: var(--line);
+      justify-self: center;
+    }
+    .stage.done .dot { background: var(--ok); }
+    .kv {
+      display: grid;
+      grid-template-columns: 92px minmax(0, 1fr);
+      gap: 8px;
+      font-size: 14px;
+      margin: 6px 0;
+    }
+    .k { color: var(--muted); }
+    .v { overflow-wrap: anywhere; }
+    details {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px 10px;
+      margin: 8px 0;
+      background: #fff;
+    }
+    summary { cursor: pointer; font-weight: 650; }
+    pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      color: #344054;
+    }
+    .status-ok { color: var(--ok); }
+    .status-bad { color: var(--bad); }
+    .muted { color: var(--muted); }
+    .loading {
+      opacity: 0.65;
+      pointer-events: none;
+    }
+    @media (max-width: 980px) {
+      .top-inner, .shell {
+        grid-template-columns: 1fr;
+      }
+      .metrics {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .inspector {
+        position: static;
+        max-height: none;
+      }
+      .examples {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="top-inner">
+      <div>
+        <h1>AgentFlow</h1>
+        <div class="subtitle">Supervisor · Workers · Skills · MCP Tools</div>
+      </div>
+      <div class="metrics">
+        <div class="metric"><div class="metric-label">最近路由</div><div class="metric-value" id="metric-route">-</div></div>
+        <div class="metric"><div class="metric-label">延迟</div><div class="metric-value" id="metric-latency">-</div></div>
+        <div class="metric"><div class="metric-label">工具调用</div><div class="metric-value" id="metric-tools">0</div></div>
+        <div class="metric"><div class="metric-label">记忆</div><div class="metric-value" id="metric-memory">-</div></div>
+      </div>
+    </div>
+  </header>
 
-    st.subheader("执行轨迹")
-    col1, col2, col3 = st.columns([1, 1, 2])
-    col1.metric("路由", state.get("route", "-"))
-    col2.metric("耗时", f"{state.get('latency_ms', '-')} ms")
-    col3.write(f"路由原因: {state.get('route_reason', '-')}")
+  <main class="shell">
+    <section class="panel main-panel">
+      <div class="workspace-title">
+        <div>
+          <h2>任务控制台</h2>
+          <p>输入任务后由 Supervisor 选择 Skill、Worker 和工具链。</p>
+        </div>
+        <div class="kbd">Ctrl / ⌘ + Enter</div>
+      </div>
+      <div class="run-state" id="run-state">Ready · 等待任务输入</div>
+      <div class="session-row">
+        <label for="session">Session ID</label>
+        <input id="session" />
+        <button class="btn" id="health-btn">检查连接</button>
+      </div>
+      <div class="section-title">协作任务</div>
+      <textarea id="task" placeholder="输入一个任务，让 Supervisor 自动分配给合适的 Worker"></textarea>
+      <div class="examples" id="examples"></div>
+      <button class="btn primary" id="run-btn">运行 AgentFlow</button>
+      <div class="chat" id="chat"></div>
+    </section>
 
-    tools = state.get("used_tools", [])
-    if tools:
-        st.markdown(
-            "".join(f'<span class="tool-chip">{tool}</span>' for tool in tools),
-            unsafe_allow_html=True,
-        )
+    <aside class="panel inspector">
+      <div class="section-title">执行轨迹</div>
+      <div id="trace-empty" class="msg assistant muted">运行一次任务后，这里会展示 Supervisor 路由、工具调用和观察结果。</div>
+      <div id="trace"></div>
+      <div class="trace-block">
+        <div class="section-title">Skills</div>
+        <div id="skills"></div>
+      </div>
+      <div class="trace-block">
+        <div class="section-title">MCP Tools</div>
+        <div id="tools"></div>
+      </div>
+      <div class="trace-block">
+        <div class="section-title">最近 Trace</div>
+        <div id="recent-traces"></div>
+      </div>
+      <div class="trace-block">
+        <div class="section-title">服务状态</div>
+        <div id="health"></div>
+      </div>
+    </aside>
+  </main>
 
-    for item in state.get("observations", []):
-        with st.expander(item.get("tool", "tool observation")):
-            st.write(item.get("content", ""))
-            metadata = item.get("metadata") or {}
-            image_path = metadata.get("image_path")
-            image_url = metadata.get("image_url")
-            if image_path:
-                st.image(image_path)
-            elif image_url:
-                st.markdown(f"[打开生成图片]({image_url})")
+  <script>
+    const sessionInput = document.getElementById("session");
+    const taskInput = document.getElementById("task");
+    const runBtn = document.getElementById("run-btn");
+    const healthBtn = document.getElementById("health-btn");
+    const chat = document.getElementById("chat");
+    const sessionId = localStorage.getItem("agentflow_session") || "agentflow-demo";
+    sessionInput.value = sessionId;
 
-    st.subheader("最近 Trace")
-    for row in reversed(get_trace_store().recent(limit=5)):
-        label = f"{row.get('timestamp', '')} · {row.get('route', '-')}"
-        with st.expander(label):
-            st.write(row.get("task", ""))
-            st.caption(f"skill={row.get('route_reason', '-')} · tools={', '.join(row.get('used_tools', []))}")
-            st.write(row.get("final_answer", "")[:800])
+    sessionInput.addEventListener("input", () => {
+      localStorage.setItem("agentflow_session", sessionInput.value || "agentflow-demo");
+    });
 
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
 
-def render_chat() -> None:
-    for item in st.session_state.history:
-        with st.chat_message(item["role"]):
-            st.write(item["content"])
+    function setMetric(id, value) {
+      document.getElementById(id).textContent = value;
+    }
 
-    pending = st.session_state.pop("pending_prompt", None)
-    prompt = pending or st.chat_input("输入一个任务，让 Supervisor 自动分配给合适的 Worker")
-    if not prompt:
-        return
+    function addMessage(role, content) {
+      const div = document.createElement("div");
+      div.className = `msg ${role}`;
+      div.textContent = content;
+      chat.prepend(div);
+    }
 
-    st.session_state.history.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.write(prompt)
+    async function loadMeta() {
+      const response = await fetch("/api/meta");
+      const data = await response.json();
+      renderExamples(data.examples || []);
+      renderSkills(data.skills || []);
+      renderTools(data.tools || []);
+      renderTraces(data.traces || []);
+      updateMemoryMetric(data.memory || {});
+    }
 
-    with st.chat_message("assistant"):
-        with st.spinner("AgentFlow 正在路由、调用工具并生成回答..."):
-            try:
-                state = run_agent(prompt)
-                answer = state.get("final_answer") or state.get("worker_output", "")
-                st.session_state.last_state = state
-            except Exception as exc:
-                answer = f"运行失败: {exc}"
-                st.session_state.last_state = {"route": "error", "observations": []}
-            st.write(answer)
+    function renderExamples(examples) {
+      const box = document.getElementById("examples");
+      box.innerHTML = "";
+      examples.forEach(example => {
+        const btn = document.createElement("button");
+        btn.className = "btn";
+        btn.textContent = example;
+        btn.onclick = () => { taskInput.value = example; };
+        box.appendChild(btn);
+      });
+    }
 
-    st.session_state.history.append({"role": "assistant", "content": answer})
-    st.rerun()
+    function renderSkills(skills) {
+      document.getElementById("skills").innerHTML = skills.map(item => `
+        <details>
+          <summary>${escapeHtml(item.name)} -> ${escapeHtml(item.route)}</summary>
+          <div class="kv"><div class="k">说明</div><div class="v">${escapeHtml(item.description)}</div></div>
+          <div class="kv"><div class="k">工具</div><div class="v">${escapeHtml((item.suggested_tools || []).join(", ") || "none")}</div></div>
+          <div class="kv"><div class="k">职责</div><div class="v">${escapeHtml(item.worker_detail || "")}</div></div>
+        </details>
+      `).join("");
+    }
 
+    function renderTools(tools) {
+      document.getElementById("tools").innerHTML = tools.map(item =>
+        `<span class="chip">${escapeHtml(item.server)}.${escapeHtml(item.name)}</span>`
+      ).join("");
+    }
 
-def main() -> None:
-    _init_state()
-    render_sidebar()
-    render_header()
+    function renderTrace(result) {
+      document.getElementById("trace-empty").style.display = "none";
+      setMetric("metric-route", result.route || "-");
+      setMetric("metric-latency", `${result.latency_ms || 0} ms`);
+      setMetric("metric-tools", (result.used_tools || []).length);
+      updateMemoryMetric(result.memory || {});
 
-    render_metrics(st.session_state.last_state)
-    st.divider()
+      const tools = (result.used_tools || []).map(tool =>
+        `<span class="chip">${escapeHtml(tool)}</span>`
+      ).join("");
+      const observations = (result.observations || []).map(item => {
+        const metadata = item.metadata || {};
+        const image = metadata.image_url
+          ? `<p><a href="${escapeHtml(metadata.image_url)}" target="_blank">打开生成图片</a></p>`
+          : metadata.image_path
+            ? `<p class="muted">图片路径: ${escapeHtml(metadata.image_path)}</p>`
+            : "";
+        return `
+          <details>
+            <summary>${escapeHtml(item.tool || "tool observation")}</summary>
+            <pre>${escapeHtml(item.content || "")}</pre>
+            ${image}
+          </details>
+        `;
+      }).join("");
 
-    left, right = st.columns([1.35, 1])
-    with left:
-        st.subheader("协作对话")
-        render_examples()
-        render_chat()
-    with right:
-        render_trace(st.session_state.last_state)
+      document.getElementById("trace").innerHTML = `
+        <div class="stage-list">
+          <div class="stage done"><span class="dot"></span><span>Load memory</span></div>
+          <div class="stage done"><span class="dot"></span><span>Skill routing · ${escapeHtml(result.route_reason || "-")}</span></div>
+          <div class="stage done"><span class="dot"></span><span>Worker · ${escapeHtml(result.route || "-")}</span></div>
+          <div class="stage done"><span class="dot"></span><span>Tool calls · ${(result.used_tools || []).length}</span></div>
+          <div class="stage done"><span class="dot"></span><span>Trace persisted</span></div>
+        </div>
+        <div class="kv"><div class="k">路由</div><div class="v">${escapeHtml(result.route || "-")}</div></div>
+        <div class="kv"><div class="k">Skill</div><div class="v">${escapeHtml(result.route_reason || "-")}</div></div>
+        <div class="kv"><div class="k">工具</div><div class="v"><div class="chips">${tools || "<span class='muted'>无</span>"}</div></div></div>
+        ${observations}
+      `;
+    }
 
+    function updateMemoryMetric(memory) {
+      const total = memory.total_messages ?? 0;
+      const backend = memory.backend || "-";
+      setMetric("metric-memory", `${total} / ${backend}`);
+    }
 
-if __name__ == "__main__":
-    main()
+    function renderTraces(traces) {
+      document.getElementById("recent-traces").innerHTML = traces.slice().reverse().map(row => `
+        <details>
+          <summary>${escapeHtml(row.timestamp || "")} · ${escapeHtml(row.route || "-")}</summary>
+          <div class="kv"><div class="k">任务</div><div class="v">${escapeHtml(row.task || "")}</div></div>
+          <div class="kv"><div class="k">Skill</div><div class="v">${escapeHtml(row.route_reason || "-")}</div></div>
+          <pre>${escapeHtml((row.final_answer || "").slice(0, 800))}</pre>
+        </details>
+      `).join("") || "<div class='muted'>暂无 Trace 记录。</div>";
+    }
 
+    async function loadHealth() {
+      const response = await fetch("/api/health");
+      const data = await response.json();
+      document.getElementById("health").innerHTML = (data.checks || []).map(item => `
+        <div class="kv">
+          <div class="k">${escapeHtml(item.label)}</div>
+          <div class="v ${item.ok ? "status-ok" : "status-bad"}">${item.ok ? "正常" : "异常"} · ${escapeHtml(item.detail)}</div>
+        </div>
+      `).join("");
+      updateMemoryMetric(data.memory || {});
+    }
+
+    async function runAgent() {
+      const task = taskInput.value.trim();
+      if (!task) return;
+      document.body.classList.add("loading");
+      const runState = document.getElementById("run-state");
+      runState.className = "run-state busy";
+      runState.textContent = "Running · Supervisor 正在路由并调用工具";
+      addMessage("user", task);
+      try {
+        const response = await fetch("/api/run", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({task, session_id: sessionInput.value || "agentflow-demo"})
+        });
+        const result = await response.json();
+        addMessage("assistant", result.final_answer || "");
+        renderTrace(result);
+        runState.className = "run-state done";
+        runState.textContent = `Done · ${result.route || "-"} · ${result.latency_ms || 0} ms`;
+        const traces = await fetch("/api/traces").then(r => r.json());
+        renderTraces(traces.traces || []);
+      } catch (error) {
+        addMessage("assistant", `运行失败: ${error}`);
+        runState.className = "run-state";
+        runState.textContent = `Failed · ${error}`;
+      } finally {
+        document.body.classList.remove("loading");
+      }
+    }
+
+    runBtn.addEventListener("click", runAgent);
+    healthBtn.addEventListener("click", loadHealth);
+    taskInput.addEventListener("keydown", event => {
+      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+        runAgent();
+      }
+    });
+
+    loadMeta();
+  </script>
+</body>
+</html>
+"""

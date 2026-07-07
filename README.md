@@ -1,6 +1,6 @@
 # AgentFlow
 
-AgentFlow is a local multi-agent orchestration platform for LLM applications. It uses LangGraph to route tasks through a Supervisor, delegates work to specialized workers, and exposes PostgreSQL, Milvus, project utilities, and image generation through MCP-style tools.
+AgentFlow is a local multi-agent orchestration platform for LLM applications. It uses LangGraph to route tasks through a Supervisor, delegates work to specialized workers, exposes PostgreSQL, Milvus, project utilities, and image generation through MCP-style tools, and provides a FastAPI web interface.
 
 ## Features
 
@@ -18,6 +18,7 @@ AgentFlow is a local multi-agent orchestration platform for LLM applications. It
 - Generate images through a Right Code-compatible `gpt-image-2` image API.
 - Persist execution traces with routes, skills, tool calls, observations, final answers, latency, and estimated usage.
 - Redact common secrets from prompts and traces, and limit per-worker tool calls.
+- Serve a FastAPI dashboard with chat, metrics, skills, tools, traces, and health checks.
 
 ## Architecture
 
@@ -96,13 +97,13 @@ Do not commit real credentials.
 
 ## Usage
 
-Run the Streamlit app:
+Run the FastAPI app:
 
 ```bash
-streamlit run app.py --server.port 8502
+uvicorn app:app --host 127.0.0.1 --port 8502
 ```
 
-Open the local URL shown by Streamlit and enter a task. The UI shows route decisions, skill selection, tool calls, observations, latency, memory status, and recent traces.
+Open `http://127.0.0.1:8502` and enter a task. The UI shows route decisions, skill selection, tool calls, observations, latency, memory status, and recent traces.
 
 Example tasks:
 
