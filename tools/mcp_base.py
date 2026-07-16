@@ -5,8 +5,9 @@
 list_tools 与 call_tool。
 """
 
+import inspect
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, get_type_hints
 
 
 @dataclass
@@ -50,9 +51,30 @@ class LocalMCPServer:
             return ToolResult(False, f"工具不存在: {self.server_name}.{name}")
         _, handler = self._tools[name]
         try:
+            self._validate_arguments(handler, kwargs)
             return handler(**kwargs)
+        except (TypeError, ValueError) as exc:
+            return ToolResult(
+                False,
+                f"{self.server_name}.{name} 参数校验失败: {exc}",
+                {"arguments": kwargs},
+            )
         except Exception as exc:
             return ToolResult(False, f"{self.server_name}.{name} 调用失败: {exc}")
+
+    def _validate_arguments(self, handler: Callable[..., ToolResult], kwargs: dict[str, Any]) -> None:
+        signature = inspect.signature(handler)
+        bound = signature.bind(**kwargs)
+        bound.apply_defaults()
+        try:
+            hints = get_type_hints(handler)
+        except Exception:
+            hints = {}
+
+        for name, value in bound.arguments.items():
+            expected = hints.get(name)
+            if expected in {str, int, float, bool} and not isinstance(value, expected):
+                raise TypeError(f"{name} 应为 {expected.__name__}，实际为 {type(value).__name__}")
 
 
 class ToolRegistry:
@@ -85,4 +107,3 @@ class ToolRegistry:
         if server is None:
             return ToolResult(False, f"MCP Server 不存在: {server_name}")
         return server.call_tool(tool_name, **kwargs)
-

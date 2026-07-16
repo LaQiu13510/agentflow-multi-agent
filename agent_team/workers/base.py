@@ -1,4 +1,4 @@
-"""Worker Agent 基类。"""
+"""Worker Agent 基类与工具计划执行器。"""
 
 from dataclasses import dataclass
 
@@ -17,11 +17,14 @@ class WorkerResult:
     content: str
     observations: list[dict]
     used_tools: list[str]
+    context_stats: dict
 
 
 class BaseWorker:
     name = "base"
     role_prompt = "你是一个通用 AI 助手。"
+    default_tool_plan: tuple[str, ...] = ()
+    output_style = "给出清晰、可执行的回答。"
 
     def __init__(self, tools: ToolRegistry):
         self.tools = tools
@@ -30,8 +33,72 @@ class BaseWorker:
         self.safety = get_safety_controller()
         self._tool_calls = 0
 
-    def run(self, task: str, memory_context: str = "") -> WorkerResult:
-        raise NotImplementedError
+    def run(
+        self,
+        task: str,
+        memory_context: str = "",
+        tool_plan: list[str] | None = None,
+    ) -> WorkerResult:
+        self._reset_tool_budget()
+        plan = list(tool_plan or self.default_tool_plan)
+        observations, used_tools = self._execute_tool_plan(task, plan)
+        evidence = "\n\n".join(
+            f"[{item['tool']}]\n{item['content']}"
+            for item in observations
+        ) or "本次任务不需要调用外部工具。"
+        answer, context_stats = self._compose(
+            task,
+            evidence,
+            memory_context,
+            self._style_for_plan(plan),
+        )
+        return WorkerResult(answer, observations, used_tools, context_stats)
+
+    def _style_for_plan(self, tool_plan: list[str]) -> str:
+        return self.output_style
+
+    def _execute_tool_plan(
+        self,
+        task: str,
+        tool_plan: list[str],
+    ) -> tuple[list[dict], list[str]]:
+        observations = []
+        used_tools = []
+        for qualified_name in tool_plan[:MAX_TOOL_CALLS_PER_WORKER]:
+            if "." not in qualified_name:
+                observations.append({
+                    "tool": qualified_name,
+                    "success": False,
+                    "content": "工具名称必须使用 server.tool 格式",
+                })
+                continue
+            server_name, tool_name = qualified_name.split(".", 1)
+            result = self._call_tool(
+                server_name,
+                tool_name,
+                **self._tool_arguments(qualified_name, task),
+            )
+            observations.append({
+                "tool": qualified_name,
+                "success": result.success,
+                "content": result.content,
+                "metadata": result.metadata,
+            })
+            used_tools.append(qualified_name)
+        return observations, used_tools
+
+    def _tool_arguments(self, qualified_name: str, task: str) -> dict:
+        arguments = {
+            "postgres.list_smartkb_documents": {"limit": 8},
+            "milvus.search_smartkb": {"query": task, "top_k": 4},
+            "project.engineering_requirements": {},
+            "project.project_summary": {"project": task},
+            "project.quality_checklist": {
+                "stack": "Python, FastAPI, LangGraph, MCP-style Tools, Agent, RAG, PostgreSQL, Milvus, Redis"
+            },
+            "image.generate_image": {"prompt": task, "size": "1024x1024"},
+        }
+        return arguments.get(qualified_name, {})
 
     def _compose(
         self,
@@ -39,8 +106,8 @@ class BaseWorker:
         evidence: str,
         memory_context: str,
         style: str,
-    ) -> str:
-        prompt = self.context_manager.build_worker_prompt(
+    ) -> tuple[str, dict]:
+        prompt, context_stats = self.context_manager.build_worker_prompt_with_stats(
             ContextPacket(
                 task=task,
                 memory_context=memory_context,
@@ -49,13 +116,14 @@ class BaseWorker:
             style=style,
         )
         prompt = self.safety.redact(prompt)
-        return self.llm.chat(
+        answer = self.llm.chat(
             [
                 SystemMessage(content=self.role_prompt),
                 HumanMessage(content=prompt),
             ],
             temperature=0.2,
         )
+        return answer, context_stats
 
     def _reset_tool_budget(self):
         self._tool_calls = 0

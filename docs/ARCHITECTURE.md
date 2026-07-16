@@ -1,65 +1,75 @@
-﻿# AgentFlow Architecture
+# AgentFlow 系统架构
 
-## Components
+## 核心流程
 
 ```text
-app.py
-  Streamlit UI and health checks
-
-agent_team/supervisor.py
-  LangGraph workflow, route selection, finalization, memory write
-
-agent_team/workers/
-  Worker implementations for research, engineering, writing, and general tasks
-
-models/
-  DeepSeek LLM wrapper and embedding wrapper
-
-tools/
-  MCP-style base protocol, registry, and concrete tool servers
-
-agent_team/memory.py
-  PostgreSQL memory and in-memory fallback
+FastAPI 请求
+  -> Redis 运行时保护
+       -> 会话状态
+       -> 每分钟限流
+       -> 每日预算
+       -> 任务状态
+  -> load_memory
+       -> 短期会话记忆
+       -> 长期任务经验检索
+  -> supervisor
+       -> SkillRegistry 多意图识别
+       -> 独占 Skill 冲突处理
+  -> plan_tools
+       -> 按 Worker 生成工具计划
+  -> 单 Worker
+     或 collaboration 多 Worker 顺序协作
+  -> coordinate 协调结果
+  -> finalize
+  -> save_memory
+       -> 短期记忆
+       -> 长期记忆
+       -> AgentTraceStore
+       -> LangGraph Checkpoint
 ```
 
-## State Model
+## 状态模型
 
-`AgentFlowState` stores the runtime data shared across graph nodes:
+`AgentFlowState` 在图节点间传递以下关键信息：
 
-- `messages`: LangChain messages.
-- `session_id`: memory namespace.
-- `task`: latest user task.
-- `route`: selected worker name.
-- `route_reason`: keyword or LLM routing explanation.
-- `memory_context`: recent session context.
-- `worker_output`: raw worker response.
-- `final_answer`: final response shown to the user.
-- `observations`: tool call outputs.
-- `used_tools`: tool names.
-- `latency_ms`: execution time.
+- `messages`：LangChain 消息。
+- `session_id`、`task_id`：会话和任务标识。
+- `task`：当前用户任务。
+- `route`、`route_reason`：单 Worker 路由或 `collaboration`。
+- `skill_names`、`worker_routes`：命中的技能和有序 Worker 链。
+- `worker_tool_plans`：每个 Worker 的独立工具计划。
+- `short_term_context`、`long_term_context`：两类记忆上下文。
+- `worker_outputs`、`worker_observations`：每个 Worker 的输出和工具结果。
+- `used_tools`、`latency_ms`：执行统计。
+- `trace_record`：最终持久化追踪记录。
 
-## Routing Strategy
+## 路由策略
 
-Routing uses two layers:
+1. `SkillRegistry.match_all()` 根据触发词位置、优先级和独占规则识别技能。
+2. 图片生成属于高优先级独占 Skill，避免“架构图”同时被 Engineer 抢占。
+3. 命中一个技能时进入单 Worker 分支。
+4. 命中多个不同 Worker 的技能时进入 `collaboration` 分支，并按用户描述中的顺序执行。
+5. 没有稳定 Skill 命中时，Supervisor 使用 LLM JSON 路由降级。
 
-1. Keyword routing for high-confidence common tasks.
-2. LLM JSON routing fallback when keywords are insufficient.
+## 多 Worker 协作
 
-This keeps common demos fast and deterministic while still supporting open-ended input.
+协作节点依次执行 Worker。前一个 Worker 的结果会追加到后一个 Worker 的任务上下文，因此“先检索资料，再写报告”会先由 Researcher 获取证据，再由 Writer 基于证据生成内容。所有 Worker 完成后，`coordinate` 节点调用 Supervisor 整合结果并删除重复信息。
 
-## Tool Registry
+## 工具规划
 
-The registry stores MCP-style servers by name. Workers call tools through:
+Skill 提供推荐工具，`plan_tools` 节点根据当前工具注册表过滤不存在的工具，并为每个 Worker 保存独立计划。Worker 通过统一执行器调用工具，参数在执行前根据 Python 函数签名和类型标注校验。
 
-```python
-self.tools.call("server", "tool", **kwargs)
-```
+## 记忆与上下文
 
-This keeps worker code independent from PostgreSQL, Milvus, or any specific business logic implementation.
+- 短期记忆保存近期对话。
+- 长期记忆保存任务、答案、路由和 Skill 摘要，并按相关性检索。
+- ContextManager 对任务、记忆、上游结果和工具观察分别设置预算，避免 Prompt 无限增长。
+- PostgreSQL 不可用时，短期和长期记忆均有内存降级实现。
 
-## Failure Handling
+## Checkpoint 与恢复
 
-- Tool calls return `ToolResult(success, content, metadata)` instead of raw exceptions.
-- PostgreSQL memory falls back to in-memory storage.
-- Live checks are separate from offline tests.
-- `.env.example` documents configuration without exposing credentials.
+LangGraph 使用 `task_id` 作为 `thread_id` 保存图状态。Checkpoint 接口可以查看下一待执行节点、路由和工具计划；存在待执行节点时，Resume 接口使用相同配置继续执行。
+
+## 可观察性
+
+SSE 输出真实图节点更新。Trace 以 JSONL 保存任务、路由、技能、Worker 链、工具计划、观察结果、最终答案和延迟。Redis 运行时状态保存任务阶段、工具调用次数、预算和限流信息。

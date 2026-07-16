@@ -66,6 +66,9 @@ def check_registry():
         "image.generate_image",
     }
     assert required.issubset(names)
+    invalid = registry.call("postgres", "list_smartkb_documents", limit="eight")
+    assert invalid.success is False
+    assert "参数校验失败" in invalid.content
     return f"tools={len(tools)}"
 
 
@@ -126,6 +129,11 @@ def check_context_and_skills():
     assert registry.match("生成一张 AgentFlow 图片").name == "image_generation"
     assert registry.match("检索 RAG 知识库").route == "researcher"
     assert registry.match("设计 MCP server 测试方案").route == "engineer"
+    assert registry.get("image_generation").suggested_tools == ("image.generate_image",)
+    matches = registry.match_all("先检索 RAG 资料，再写一份技术报告")
+    assert [skill.route for skill in matches] == ["researcher", "writer"]
+    image_matches = registry.match_all("生成一个系统架构图并附带说明")
+    assert [skill.name for skill in image_matches] == ["image_generation"]
     return f"skills={len(registry.list_skills())}"
 
 

@@ -6,7 +6,7 @@ import json
 from functools import lru_cache
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query as QueryParam
 from fastapi.responses import HTMLResponse
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import HumanMessage
@@ -33,7 +33,7 @@ app = FastAPI(
 
 
 EXAMPLES = [
-    "检索 SmartKB 中关于混合检索和 RRF 的内容，并输出技术摘要。",
+    "先检索 SmartKB 中关于混合检索和 RRF 的内容，再输出技术摘要。",
     "设计一个 MCP Server，用来查询 PostgreSQL 里的对话记忆。",
     "写一段 AgentFlow README 摘要。",
     "生成一个多 Agent 协作架构图。",
@@ -53,6 +53,10 @@ def get_registry_cached():
 @lru_cache(maxsize=1)
 def get_graph_cached():
     return build_agent_team(get_registry_cached())
+
+
+def graph_config(task_id: str) -> dict[str, Any]:
+    return {"configurable": {"thread_id": task_id}}
 
 
 def memory_stats() -> dict[str, Any]:
@@ -154,13 +158,34 @@ def task_status(task_id: str) -> dict[str, Any]:
     return {"ok": bool(task), "task": task or {}}
 
 
+@app.get("/api/checkpoints/{task_id}")
+def checkpoint_status(task_id: str) -> dict[str, Any]:
+    try:
+        snapshot = get_graph_cached().get_state(graph_config(task_id))
+        values = snapshot.values or {}
+        return {
+            "ok": bool(values),
+            "task_id": task_id,
+            "next_nodes": list(snapshot.next),
+            "route": values.get("route", ""),
+            "skill_name": values.get("skill_name", ""),
+            "skill_names": values.get("skill_names", []),
+            "worker_routes": values.get("worker_routes", []),
+            "tool_plan": values.get("tool_plan", []),
+            "worker_tool_plans": values.get("worker_tool_plans", {}),
+            "used_tools": values.get("used_tools", []),
+            "latency_ms": values.get("latency_ms", 0),
+        }
+    except Exception as exc:
+        return {"ok": False, "task_id": task_id, "error": str(exc)[:300]}
+
+
 @app.get("/api/traces")
 def traces(limit: int = 8) -> dict[str, Any]:
     return {"traces": get_trace_store().recent(limit=limit)}
 
 
-@app.post("/api/run")
-def run_agent(request: RunRequest) -> dict[str, Any]:
+def prepare_run(request: RunRequest) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     session_id = request.session_id or DEFAULT_SESSION_ID
     runtime_store = get_runtime_state()
     safety = get_safety_controller()
@@ -172,7 +197,7 @@ def run_agent(request: RunRequest) -> dict[str, Any]:
     rate_limit = runtime_store.check_rate_limit(session_id)
     if not rate_limit.get("allowed", True):
         runtime_store.touch_session(session_id, {"status": "rate_limited"})
-        return blocked_run_response(
+        return None, blocked_run_response(
             request,
             session_id,
             "请求过快，请稍后再试。",
@@ -186,7 +211,7 @@ def run_agent(request: RunRequest) -> dict[str, Any]:
     )
     if not prompt_budget.get("allowed", True):
         runtime_store.touch_session(session_id, {"status": "budget_blocked"})
-        return blocked_run_response(
+        return None, blocked_run_response(
             request,
             session_id,
             "今日预算已达到上限，请明天再试或调高预算配置。",
@@ -196,20 +221,25 @@ def run_agent(request: RunRequest) -> dict[str, Any]:
     task_record = runtime_store.create_task(session_id, request.task)
     task_id = task_record["task_id"]
     runtime_store.update_task(task_id, "running")
+    return {
+        "session_id": session_id,
+        "runtime_store": runtime_store,
+        "safety": safety,
+        "rate_limit": rate_limit,
+        "prompt_budget": prompt_budget,
+        "task_id": task_id,
+    }, None
 
-    graph = get_graph_cached()
-    try:
-        state = graph.invoke(
-            {
-                "messages": [HumanMessage(content=request.task)],
-                "session_id": session_id,
-                "task_id": task_id,
-            }
-        )
-    except Exception as exc:
-        runtime_store.update_task(task_id, "failed", error=str(exc)[:300])
-        runtime_store.touch_session(session_id, {"status": "failed", "last_task_id": task_id})
-        raise
+
+def complete_run(
+    request: RunRequest,
+    state: dict[str, Any],
+    execution: dict[str, Any],
+) -> dict[str, Any]:
+    session_id = execution["session_id"]
+    task_id = execution["task_id"]
+    runtime_store = execution["runtime_store"]
+    safety = execution["safety"]
 
     final_answer = state.get("final_answer") or state.get("worker_output", "")
     answer_budget = runtime_store.add_budget_units(
@@ -239,6 +269,12 @@ def run_agent(request: RunRequest) -> dict[str, Any]:
         "route": state.get("route", "-"),
         "route_reason": state.get("route_reason", "-"),
         "skill_name": state.get("skill_name", ""),
+        "skill_names": state.get("skill_names", []),
+        "worker_routes": state.get("worker_routes", []),
+        "worker_tool_plans": state.get("worker_tool_plans", {}),
+        "worker_outputs": state.get("worker_outputs", {}),
+        "worker_context_stats": state.get("worker_context_stats", {}),
+        "tool_plan": state.get("tool_plan", []),
         "used_tools": state.get("used_tools", []),
         "observations": state.get("observations", []),
         "final_answer": final_answer,
@@ -247,12 +283,43 @@ def run_agent(request: RunRequest) -> dict[str, Any]:
         "trace": state.get("trace_record", {}),
         "runtime": {
             "task": task_record,
-            "rate_limit": rate_limit,
+            "rate_limit": execution["rate_limit"],
             "budget": answer_budget,
             "tool_stats": runtime_store.get_tool_stats(session_id),
             "state": runtime_stats(),
         },
     }
+
+
+def fail_run(execution: dict[str, Any], exc: Exception) -> None:
+    runtime_store = execution["runtime_store"]
+    task_id = execution["task_id"]
+    session_id = execution["session_id"]
+    runtime_store.update_task(task_id, "failed", error=str(exc)[:300])
+    runtime_store.touch_session(session_id, {"status": "failed", "last_task_id": task_id})
+
+
+@app.post("/api/run")
+def run_agent(request: RunRequest) -> dict[str, Any]:
+    execution, blocked = prepare_run(request)
+    if blocked:
+        return blocked
+    assert execution is not None
+
+    task_id = execution["task_id"]
+    try:
+        state = get_graph_cached().invoke(
+            {
+                "messages": [HumanMessage(content=request.task)],
+                "session_id": execution["session_id"],
+                "task_id": task_id,
+            },
+            config=graph_config(task_id),
+        )
+    except Exception as exc:
+        fail_run(execution, exc)
+        raise
+    return complete_run(request, state, execution)
 
 
 def blocked_run_response(
@@ -268,6 +335,12 @@ def blocked_run_response(
         "route": "-",
         "route_reason": "runtime_guard",
         "skill_name": "",
+        "skill_names": [],
+        "worker_routes": [],
+        "worker_tool_plans": {},
+        "worker_outputs": {},
+        "worker_context_stats": {},
+        "tool_plan": [],
         "used_tools": [],
         "observations": [],
         "final_answer": message,
@@ -278,18 +351,93 @@ def blocked_run_response(
     }
 
 
+@app.post("/api/tasks/{task_id}/resume")
+def resume_task(task_id: str) -> dict[str, Any]:
+    runtime_store = get_runtime_state()
+    task_record = runtime_store.get_task(task_id)
+    if not task_record:
+        return {"ok": False, "task_id": task_id, "error": "任务不存在或已过期"}
+
+    config = graph_config(task_id)
+    try:
+        snapshot = get_graph_cached().get_state(config)
+        if not snapshot.next:
+            return {
+                "ok": True,
+                "task_id": task_id,
+                "status": task_record.get("status", "done"),
+                "message": "任务没有待续跑节点",
+            }
+
+        runtime_store.update_task(task_id, "running", resumed=True)
+        state = get_graph_cached().invoke(None, config=config)
+        final_answer = state.get("final_answer") or state.get("worker_output", "")
+        updated = runtime_store.update_task(
+            task_id,
+            "done",
+            resumed=True,
+            route=state.get("route", "-"),
+            route_reason=state.get("route_reason", "-"),
+            latency_ms=state.get("latency_ms", 0),
+            used_tools=state.get("used_tools", []),
+        )
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "status": "done",
+            "route": state.get("route", "-"),
+            "worker_routes": state.get("worker_routes", []),
+            "tool_plan": state.get("tool_plan", []),
+            "worker_tool_plans": state.get("worker_tool_plans", {}),
+            "used_tools": state.get("used_tools", []),
+            "final_answer": final_answer,
+            "task": updated,
+        }
+    except Exception as exc:
+        runtime_store.update_task(task_id, "failed", resumed=True, error=str(exc)[:300])
+        return {"ok": False, "task_id": task_id, "error": str(exc)[:300]}
+
+
 @app.get("/api/run/stream")
-def run_agent_stream(task: str, session_id: str = DEFAULT_SESSION_ID) -> StreamingResponse:
+def run_agent_stream(
+    task: str = QueryParam(..., min_length=1, max_length=4000),
+    session_id: str = QueryParam(default=DEFAULT_SESSION_ID, min_length=1, max_length=120),
+) -> StreamingResponse:
     def generate():
-        yield sse("stage", {"message": "Supervisor 正在分析任务"})
+        request = RunRequest(task=task, session_id=session_id)
+        execution, blocked = prepare_run(request)
+        if blocked:
+            yield sse("delta", {"text": blocked.get("final_answer", "请求被运行时策略拦截。")})
+            yield sse("final", blocked)
+            return
+        assert execution is not None
+
+        task_id = execution["task_id"]
+        config = graph_config(task_id)
+        graph_input = {
+            "messages": [HumanMessage(content=task)],
+            "session_id": execution["session_id"],
+            "task_id": task_id,
+        }
         try:
-            result = run_agent(RunRequest(task=task, session_id=session_id))
-            yield sse("stage", {"message": f"已路由到 {result.get('route', '-')}"})
+            yield sse("stage", {"node": "start", "message": "任务已创建，开始执行 Agent 图"})
+            for event in get_graph_cached().stream(
+                graph_input,
+                config=config,
+                stream_mode="updates",
+            ):
+                for node, update in event.items():
+                    yield sse("stage", graph_stage_payload(node, update or {}))
+
+            snapshot = get_graph_cached().get_state(config)
+            state = dict(snapshot.values or {})
+            result = complete_run(request, state, execution)
             answer = result.get("final_answer", "")
             for chunk in chunk_text(answer):
                 yield sse("delta", {"text": chunk})
             yield sse("final", result)
         except Exception as exc:
+            fail_run(execution, exc)
             yield sse("app_error", {"message": str(exc)[:500]})
 
     return StreamingResponse(
@@ -297,6 +445,30 @@ def run_agent_stream(task: str, session_id: str = DEFAULT_SESSION_ID) -> Streami
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+def graph_stage_payload(node: str, update: dict[str, Any]) -> dict[str, Any]:
+    labels = {
+        "load_memory": "已加载短期记忆与长期记忆",
+        "supervisor": "Supervisor 已完成意图识别",
+        "plan_tools": "已生成 Worker 工具计划",
+        "researcher": "Researcher 已完成知识检索",
+        "engineer": "Engineer 已完成工程分析",
+        "writer": "Writer 已完成内容生成",
+        "general": "General 已完成通用任务",
+        "collaboration": "多个 Worker 已完成协作与结果交接",
+        "coordinate": "Supervisor 已整合多个 Worker 结果",
+        "finalize": "最终答案已生成",
+        "save_memory": "记忆与执行 Trace 已持久化",
+    }
+    return {
+        "node": node,
+        "message": labels.get(node, f"节点 {node} 已完成"),
+        "route": update.get("route", ""),
+        "worker_routes": update.get("worker_routes", []),
+        "tool_plan": update.get("tool_plan", []),
+        "used_tools": update.get("used_tools", []),
+    }
 
 
 def sse(event: str, data: dict[str, Any]) -> str:
@@ -766,6 +938,7 @@ INDEX_HTML = r"""
       const budgetText = budget.limit
         ? `${budget.used ?? 0}/${budget.limit}`
         : `${budget.used ?? 0}`;
+      const workers = (result.worker_routes || []).join(" → ") || result.route || "-";
 
       const tools = (result.used_tools || []).map(tool =>
         `<span class="chip">${escapeHtml(tool)}</span>`
@@ -788,14 +961,15 @@ INDEX_HTML = r"""
 
       document.getElementById("trace").innerHTML = `
         <div class="stage-list">
-          <div class="stage done"><span class="dot"></span><span>Load memory</span></div>
-          <div class="stage done"><span class="dot"></span><span>Skill routing · ${escapeHtml(result.route_reason || "-")}</span></div>
-          <div class="stage done"><span class="dot"></span><span>Worker · ${escapeHtml(result.route || "-")}</span></div>
-          <div class="stage done"><span class="dot"></span><span>Tool calls · ${(result.used_tools || []).length}</span></div>
-          <div class="stage done"><span class="dot"></span><span>Trace persisted</span></div>
+          <div class="stage done"><span class="dot"></span><span>记忆加载完成</span></div>
+          <div class="stage done"><span class="dot"></span><span>技能路由 · ${escapeHtml(result.route_reason || "-")}</span></div>
+          <div class="stage done"><span class="dot"></span><span>Worker 协作 · ${escapeHtml(workers)}</span></div>
+          <div class="stage done"><span class="dot"></span><span>工具调用 · ${(result.used_tools || []).length}</span></div>
+          <div class="stage done"><span class="dot"></span><span>执行追踪已持久化</span></div>
         </div>
         <div class="kv"><div class="k">Task ID</div><div class="v">${escapeHtml(result.task_id || "-")}</div></div>
         <div class="kv"><div class="k">路由</div><div class="v">${escapeHtml(result.route || "-")}</div></div>
+        <div class="kv"><div class="k">协作链</div><div class="v">${escapeHtml(workers)}</div></div>
         <div class="kv"><div class="k">Skill</div><div class="v">${escapeHtml(result.route_reason || "-")}</div></div>
         <div class="kv"><div class="k">预算</div><div class="v">${escapeHtml(budgetText)}</div></div>
         <div class="kv"><div class="k">工具</div><div class="v"><div class="chips">${tools || "<span class='muted'>无</span>"}</div></div></div>

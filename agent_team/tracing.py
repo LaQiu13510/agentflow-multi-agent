@@ -23,11 +23,21 @@ class AgentTraceStore:
         record = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "session_id": state.get("session_id", ""),
+            "task_id": state.get("task_id", ""),
             "task": self.safety.redact(state.get("task", "")),
             "route": state.get("route", ""),
             "route_reason": state.get("route_reason", ""),
+            "worker_routes": state.get("worker_routes", []),
+            "skill_names": state.get("skill_names", []),
+            "tool_plan": state.get("tool_plan", []),
+            "worker_tool_plans": state.get("worker_tool_plans", {}),
             "used_tools": state.get("used_tools", []),
             "observations": self._redact_observations(state.get("observations", [])),
+            "worker_outputs": {
+                worker: self.safety.redact(content)
+                for worker, content in state.get("worker_outputs", {}).items()
+            },
+            "worker_context_stats": state.get("worker_context_stats", {}),
             "final_answer": self.safety.redact(state.get("final_answer", "")),
             "latency_ms": state.get("latency_ms", 0),
             "estimated_units": self.safety.estimate_units(state.get("final_answer", "")),

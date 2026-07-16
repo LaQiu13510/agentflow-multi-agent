@@ -128,14 +128,18 @@ def patch_runtime(
     supervisor_module.get_long_term_memory = lambda: long_term_memory
 
 
-def run_case(graph, task: str, expected_route: str):
+def run_case(graph, task: str, expected_route: str, expected_tools: list[str]):
+    task_id = f"offline-{expected_route}"
     state = graph.invoke(
         {
             "messages": [HumanMessage(content=task)],
             "session_id": "offline-e2e",
-        }
+            "task_id": task_id,
+        },
+        config={"configurable": {"thread_id": task_id}},
     )
     assert state["route"] == expected_route, state
+    assert state.get("tool_plan") == expected_tools, state
     assert state.get("final_answer"), state
     assert state.get("used_tools"), state
     assert state.get("latency_ms", 0) >= 0, state
@@ -144,6 +148,81 @@ def run_case(graph, task: str, expected_route: str):
         f"latency={state['latency_ms']}ms"
     )
     return state
+
+
+def run_collaboration_case(graph):
+    task_id = "offline-collaboration"
+    state = graph.invoke(
+        {
+            "messages": [HumanMessage(content="先检索知识库中的 RAG 资料，再写一份技术报告")],
+            "session_id": "offline-e2e",
+            "task_id": task_id,
+        },
+        config={"configurable": {"thread_id": task_id}},
+    )
+    assert state["route"] == "collaboration", state
+    assert state["worker_routes"] == ["researcher", "writer"], state
+    assert state["worker_tool_plans"] == {
+        "researcher": ["postgres.list_smartkb_documents", "milvus.search_smartkb"],
+        "writer": ["project.project_summary", "project.quality_checklist"],
+    }, state
+    assert list(state["worker_outputs"]) == ["researcher", "writer"], state
+    assert state["worker_context_stats"]["researcher"]["prompt_chars"] > 0, state
+    assert (
+        state["worker_context_stats"]["writer"]["prompt_chars"]
+        <= state["worker_context_stats"]["writer"]["total_budget"]
+    ), state
+    assert len(state["used_tools"]) == 4, state
+    assert state.get("trace_record", {}).get("worker_routes") == ["researcher", "writer"]
+    print(
+        "[OK] collaboration routes="
+        f"{' -> '.join(state['worker_routes'])} tools={len(state['used_tools'])}"
+    )
+    return state
+
+
+def run_api_stream_case(graph):
+    import app as app_module
+    from fastapi.testclient import TestClient
+
+    app_module.get_graph_cached = lambda: graph
+    client = TestClient(app_module.app)
+    response = client.get(
+        "/api/run/stream",
+        params={
+            "task": "先检索知识库中的 RRF 资料，再写一份摘要",
+            "session_id": "offline-stream",
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.text
+    assert "event: stage" in body
+    assert '"node": "supervisor"' in body
+    assert '"node": "plan_tools"' in body
+    assert '"node": "collaboration"' in body
+    assert "event: delta" in body
+    assert "event: final" in body
+    invalid = client.get("/api/run/stream", params={"task": "", "session_id": "offline-stream"})
+    assert invalid.status_code == 422
+
+    run_response = client.post(
+        "/api/run",
+        json={
+            "task": "先检索 RAG 资料，再写一份报告",
+            "session_id": "offline-api",
+        },
+    )
+    assert run_response.status_code == 200, run_response.text
+    result = run_response.json()
+    assert result["route"] == "collaboration"
+    assert result["worker_routes"] == ["researcher", "writer"]
+    checkpoint = client.get(f"/api/checkpoints/{result['task_id']}")
+    assert checkpoint.status_code == 200
+    assert checkpoint.json()["worker_routes"] == ["researcher", "writer"]
+    resume = client.post(f"/api/tasks/{result['task_id']}/resume")
+    assert resume.status_code == 200
+    assert resume.json()["ok"] is True
+    print("[OK] SSE streams real LangGraph node updates and final answer")
 
 
 def run_offline_e2e():
@@ -155,21 +234,39 @@ def run_offline_e2e():
     graph = build_agent_team(build_fake_registry())
 
     cases = [
-        ("请检索知识库中关于混合检索和 RRF 的资料", "researcher"),
-        ("帮我设计一个 MCP server 的代码结构和测试方案", "engineer"),
-        ("写一段 AgentFlow README 摘要", "writer"),
-        ("生成一张 AgentFlow 架构图片", "general"),
+        (
+            "请检索知识库中关于混合检索和 RRF 的资料",
+            "researcher",
+            ["postgres.list_smartkb_documents", "milvus.search_smartkb"],
+        ),
+        (
+            "帮我设计一个 MCP server 的代码结构和测试方案",
+            "engineer",
+            ["project.engineering_requirements", "milvus.search_smartkb"],
+        ),
+        (
+            "写一段 AgentFlow README 摘要",
+            "writer",
+            ["project.project_summary", "project.quality_checklist"],
+        ),
+        (
+            "生成一张 AgentFlow 架构图片",
+            "general",
+            ["image.generate_image"],
+        ),
     ]
     last_state = None
-    for task, expected_route in cases:
-        last_state = run_case(graph, task, expected_route)
+    for task, expected_route, expected_tools in cases:
+        last_state = run_case(graph, task, expected_route, expected_tools)
+
+    collaboration_state = run_collaboration_case(graph)
 
     stats = memory.stats()
-    assert stats["total_messages"] == len(cases) * 2
+    assert stats["total_messages"] == (len(cases) + 1) * 2
     print(f"[OK] memory backend={stats['backend']} messages={stats['total_messages']}")
 
     long_stats = long_term_memory.stats()
-    assert long_stats["total_memories"] == len(cases)
+    assert long_stats["total_memories"] == len(cases) + 1
     long_context = long_term_memory.format_context("MCP server 测试方案", "offline-e2e")
     assert "MCP" in long_context
     print(
@@ -177,6 +274,8 @@ def run_offline_e2e():
         f"memories={long_stats['total_memories']}"
     )
     print(f"[OK] last answer preview={last_state['final_answer'][:80]}")
+    assert "researcher" in collaboration_state["worker_outputs"]
+    run_api_stream_case(graph)
 
 
 def run_live_health():

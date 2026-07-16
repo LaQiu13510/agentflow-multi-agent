@@ -1,92 +1,54 @@
-﻿# AgentFlow Project Report
+# AgentFlow 项目设计说明
 
-## Overview
+## 项目目标
 
-AgentFlow is a multi-agent orchestration application for LLM workflows. It demonstrates how to route a user task through a Supervisor, execute it with specialized workers, call external systems through a tool protocol, and return an answer with an execution trace.
+AgentFlow 用于解决复杂 AI 任务中单 Agent 同时承担路由、检索、工程设计、写作和工具调用导致的职责混乱问题。项目强调任务分工、上下文控制、执行恢复和可观察性，而不是只展示一次模型调用。
 
-The project is designed as a runnable local system rather than a static prototype. It includes a Streamlit UI, deterministic tests, live health checks, database-backed memory, and a tool registry.
+## 关键设计
 
-## Goals
+### Supervisor 与 Skill
 
-AgentFlow focuses on four engineering goals:
+Supervisor 负责识别任务意图。高置信度任务先由 SkillRegistry 确定性匹配，开放任务再进入 LLM 路由。Skill 定义触发词、优先级、独占规则、输入输出契约和推荐工具，使路由规则与 Worker 代码解耦。
 
-1. Make agent routing explicit and observable.
-2. Separate worker logic from tool implementations.
-3. Reuse an existing retrieval system as an agent tool.
-4. Keep the local demo stable even when an external service is temporarily unavailable.
+### 多 Worker 协作
 
-## Core Workflow
+单意图任务只执行一个 Worker。复合任务生成有序 Worker 链，并把上游结果传给下游。协调节点最终整合多个结果，避免直接把各 Worker 文本简单拼接给用户。
 
-```text
-Input message
-  -> load_memory
-  -> supervisor
-  -> selected worker
-  -> tool calls
-  -> final answer
-  -> memory write
-```
+### 工具层
 
-The workflow is implemented with LangGraph `StateGraph`. Each node updates a shared state object containing messages, route metadata, tool observations, the worker output, and latency.
+所有 Worker 使用相同的工具计划执行器。MCP 风格注册表统一提供工具发现、参数校验、错误封装和元数据返回，数据库、向量库和图片服务不会直接耦合到 Worker 实现。
 
-## Worker Roles
+### 上下文与记忆
 
-| Worker | Responsibility | Typical Tools |
-| --- | --- | --- |
-| researcher | Retrieve and summarize knowledge | PostgreSQL, Milvus |
-| engineer | Design modules, interfaces, and tests | Project tools, Milvus |
-| writer | Produce project documentation text | Project tools |
-| general | Coordinate lightweight tasks | Project tools |
+ContextManager 分别控制历史记忆和工具证据预算。短期记忆保存会话，长期记忆沉淀可复用任务经验，并在后续任务中按相关性注入。多 Worker 协作时，上游输出也受上下文组织约束。
 
-## Tool Layer
+### 可靠性与恢复
 
-AgentFlow implements a local MCP-style protocol. Each server exposes:
+Redis 运行时层提供会话 TTL、限流、预算和任务状态。LangGraph Checkpointer 保存图状态，任务中断后可通过相同 `thread_id` 恢复。外部存储不可用时，记忆和运行时状态有内存降级路径。
 
-- `list_tools()`: returns tool names, descriptions, and input schema.
-- `call_tool(name, **kwargs)`: executes a named tool and returns a structured result.
+### 可观察性
 
-The current servers are:
+FastAPI SSE 输出真实图节点进度。AgentTraceStore 记录路由原因、技能命中、Worker 链、工具计划、实际调用、观察结果、延迟和最终回答，便于调试和复盘。
 
-- PostgreSQL server for metadata and table-safe queries.
-- Milvus server for SmartKB vector search.
-- Project server for engineering summaries and quality checklists.
+## 模块职责
 
-## Memory Design
+| 模块 | 职责 |
+| --- | --- |
+| `agent_team/supervisor.py` | LangGraph 编排、协作和协调 |
+| `agent_team/skills.py` | Skill 定义、优先级和多意图匹配 |
+| `agent_team/workers/` | 专业 Worker 与统一工具执行器 |
+| `agent_team/context.py` | Prompt 上下文预算与组织 |
+| `agent_team/memory.py` | 短期记忆 |
+| `agent_team/long_term_memory.py` | 长期任务经验 |
+| `agent_team/runtime_state.py` | Redis / 内存运行时保护 |
+| `agent_team/tracing.py` | JSONL 执行追踪 |
+| `tools/` | MCP 风格工具层 |
+| `app.py` | FastAPI、SSE、任务和恢复接口 |
+| `eval/agent_eval.py` | 单意图与多意图评测 |
 
-The memory module writes conversation turns to PostgreSQL when the database is available. If connection or table initialization fails, it falls back to an in-memory implementation with the same interface. This keeps UI demos and offline tests stable while preserving production-like behavior for live runs.
+## 已知边界
 
-## SmartKB Integration
-
-AgentFlow can query the SmartKB Milvus collection produced by `smartkb-rag`. This creates a clean separation:
-
-- SmartKB owns document ingestion, chunking, embedding, retrieval, and answer generation.
-- AgentFlow owns task routing, worker specialization, tool orchestration, and execution traces.
-
-## UI
-
-The Streamlit app exposes:
-
-- Current route and route reason.
-- Worker output.
-- Tool names and observations.
-- Latency.
-- Memory backend and message count.
-- Service health checks.
-
-## Validation
-
-The project includes two test scripts:
-
-- `test_imports.py`: configuration, imports, tool registry, keyword routing, memory fallback.
-- `test_e2e.py`: offline LangGraph end-to-end execution with fake LLM and fake MCP servers.
-
-Both scripts support a `--live` mode for external service health checks.
-
-## Current Status
-
-AgentFlow is complete as a local multi-agent demo:
-
-- The UI starts with Streamlit.
-- Offline tests pass without external services.
-- Live checks verify LLM, embedding, PostgreSQL, and Milvus connectivity.
-- GitHub documentation and safe configuration templates are included.
+- 当前多 Worker 协作采用有序执行，适合存在上下游依赖的任务；完全独立的子任务尚未并行执行。
+- 工具层是进程内 MCP 风格实现，不等同于独立官方 MCP Server。
+- 默认 Checkpointer 为内存实现，生产部署可替换为持久化 Checkpointer。
+- 规则未命中的语义改写依赖 LLM 路由，离线 Skill 评测不会覆盖这部分能力。

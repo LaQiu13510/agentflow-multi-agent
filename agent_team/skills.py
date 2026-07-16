@@ -18,6 +18,8 @@ class Skill:
     output_format: str = ""
     fallback_route: str = "general"
     worker_detail: str = ""
+    priority: int = 0
+    exclusive: bool = False
 
 
 class SkillRegistry:
@@ -27,13 +29,29 @@ class SkillRegistry:
         self.skills = skills
 
     def match(self, task: str) -> Skill | None:
+        matches = self.match_all(task)
+        return matches[0] if matches else None
+
+    def match_all(self, task: str) -> list[Skill]:
+        """返回任务命中的全部技能，并保留用户描述中的执行顺序。"""
         text = task.lower()
-        best: tuple[int, Skill] | None = None
-        for skill in self.skills:
-            score = sum(1 for trigger in skill.triggers if trigger.lower() in text)
-            if score and (best is None or score > best[0]):
-                best = (score, skill)
-        return best[1] if best else None
+        matches: list[tuple[int, int, int, Skill]] = []
+        for index, skill in enumerate(self.skills):
+            positions = [
+                text.find(trigger.lower())
+                for trigger in skill.triggers
+                if trigger.lower() in text
+            ]
+            if positions:
+                matches.append((min(positions), -skill.priority, index, skill))
+
+        exclusive = [item for item in matches if item[3].exclusive]
+        if exclusive:
+            exclusive.sort(key=lambda item: (item[1], item[0], item[2]))
+            return [exclusive[0][3]]
+
+        matches.sort(key=lambda item: (item[0], item[1], item[2]))
+        return [item[3] for item in matches]
 
     def list_skills(self) -> list[dict]:
         return [
@@ -47,9 +65,14 @@ class SkillRegistry:
                 "output_format": skill.output_format,
                 "fallback_route": skill.fallback_route,
                 "worker_detail": skill.worker_detail,
+                "priority": skill.priority,
+                "exclusive": skill.exclusive,
             }
             for skill in self.skills
         ]
+
+    def get(self, name: str) -> Skill | None:
+        return next((skill for skill in self.skills if skill.name == name), None)
 
 
 def build_default_skill_registry() -> SkillRegistry:
@@ -59,7 +82,10 @@ def build_default_skill_registry() -> SkillRegistry:
                 name="image_generation",
                 route="general",
                 description="Generate images, architecture diagrams, flow diagrams, and visual sketches from text prompts.",
-                triggers=("生图", "图片", "图像", "架构图", "流程图", "示意图", "image", "generate image", "gpt-image"),
+                triggers=(
+                    "生图", "图片", "图像", "画图", "绘图", "架构图", "流程图",
+                    "示意图", "拓扑图", "可视化", "image", "generate image", "diagram", "gpt-image",
+                ),
                 suggested_tools=("image.generate_image",),
                 input_schema={"prompt": "required string", "size": "optional image size, default 1024x1024"},
                 output_format="Return the generated image URL or local image path with a concise status note.",
@@ -68,12 +94,17 @@ def build_default_skill_registry() -> SkillRegistry:
                     "General worker handles image generation tasks by calling the image MCP server, "
                     "then reports the generated URL/path without pretending to inspect the image."
                 ),
+                priority=100,
+                exclusive=True,
             ),
             Skill(
                 name="knowledge_research",
                 route="researcher",
                 description="Retrieve and summarize evidence from SmartKB, Milvus, and PostgreSQL metadata.",
-                triggers=("检索", "知识库", "资料", "rag", "milvus", "postgresql"),
+                triggers=(
+                    "检索", "搜索", "查找", "知识库", "向量库", "资料", "材料", "证据", "已有信息",
+                    "rag", "milvus", "postgresql",
+                ),
                 suggested_tools=("postgres.list_smartkb_documents", "milvus.search_smartkb"),
                 input_schema={"task": "research question or evidence request"},
                 output_format="Key findings, evidence sources, and recommended next steps.",
@@ -87,7 +118,10 @@ def build_default_skill_registry() -> SkillRegistry:
                 name="engineering_design",
                 route="engineer",
                 description="Plan architecture, interfaces, implementation, debugging, deployment, and tests.",
-                triggers=("架构", "实现", "代码", "接口", "测试", "bug", "部署", "mcp server"),
+                triggers=(
+                    "架构", "实现", "代码", "接口", "测试", "调试", "故障", "重构",
+                    "bug", "部署", "docker", "容器化", "一键", "可恢复", "落地方案", "mcp server",
+                ),
                 suggested_tools=("project.engineering_requirements", "milvus.search_smartkb"),
                 input_schema={"task": "engineering problem, feature request, bug, or test plan"},
                 output_format="Goal, modules, flow, tests, risks, and observability.",
@@ -101,7 +135,10 @@ def build_default_skill_registry() -> SkillRegistry:
                 name="technical_writing",
                 route="writer",
                 description="Produce project documentation, reports, summaries, release notes, and polished technical text.",
-                triggers=("文档", "报告", "摘要", "润色", "说明", "readme", "release", "pitch"),
+                triggers=(
+                    "文档", "报告", "摘要", "润色", "说明", "撰写", "文章", "整理",
+                    "复盘", "手册", "readme", "release", "pitch",
+                ),
                 suggested_tools=("project.project_summary", "project.quality_checklist"),
                 input_schema={"task": "documentation or writing request"},
                 output_format="Clear Chinese technical writing with concise structure and no exaggeration.",
